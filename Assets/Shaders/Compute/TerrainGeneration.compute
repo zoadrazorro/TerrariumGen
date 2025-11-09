@@ -1,0 +1,257 @@
+// GPU-Accelerated Terrain Generation Compute Shader
+// Generates height, moisture, and temperature maps in microseconds
+#pragma kernel GenerateTerrain
+#pragma kernel ApplyWorldEvents
+
+// Output buffers
+RWStructuredBuffer<float> HeightMap;
+RWStructuredBuffer<float> MoistureMap;
+RWStructuredBuffer<float> TemperatureMap;
+
+// World event data
+struct WorldEvent
+{
+    int type; // 0=None, 1=MagicalExplosion, 2=Crystallized, etc.
+    float3 epicenter;
+    float radius;
+    float intensity;
+    float timestamp;
+};
+
+RWStructuredBuffer<WorldEvent> ActiveEvents;
+
+// Parameters
+int Resolution;
+int ChunkX;
+int ChunkZ;
+int ChunkSize;
+int Seed;
+float Scale;
+int Octaves;
+float Persistence;
+float Lacunarity;
+float HeightMultiplier;
+
+// Noise function (Perlin-like)
+float hash(float2 p)
+{
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+
+float noise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float a = hash(i);
+    float b = hash(i + float2(1.0, 0.0));
+    float c = hash(i + float2(0.0, 1.0));
+    float d = hash(i + float2(1.0, 1.0));
+
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float fbm(float2 p, int octaves, float persistence, float lacunarity)
+{
+    float value = 0.0;
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float maxValue = 0.0;
+
+    for (int i = 0; i < octaves; i++)
+    {
+        value += noise(p * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+
+    return value / maxValue;
+}
+
+// Ridged multi-fractal noise (good for mountains)
+float ridgedNoise(float2 p, int octaves, float persistence, float lacunarity)
+{
+    float value = 0.0;
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float weight = 1.0;
+
+    for (int i = 0; i < octaves; i++)
+    {
+        float n = 1.0 - abs(noise(p * frequency));
+        n = n * n * weight;
+
+        value += n * amplitude;
+        weight = saturate(n * 2.0);
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+
+    return value;
+}
+
+// Voronoi noise (good for cellular patterns)
+float voronoi(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+
+    float minDist = 1.0;
+
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            float2 neighbor = float2(x, y);
+            float2 point = hash(i + neighbor) * float2(1.0, 1.0);
+            float2 diff = neighbor + point - f;
+            float dist = length(diff);
+            minDist = min(minDist, dist);
+        }
+    }
+
+    return minDist;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateTerrain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Resolution || id.y >= Resolution)
+        return;
+
+    // Calculate world position
+    float2 worldPos = float2(
+        ChunkX * ChunkSize + (id.x / (float)Resolution) * ChunkSize,
+        ChunkZ * ChunkSize + (id.y / (float)Resolution) * ChunkSize
+    );
+
+    // Add seed offset
+    float2 samplePos = (worldPos + float2(Seed, Seed)) * Scale;
+
+    int index = id.x + id.y * Resolution;
+
+    // ========== HEIGHT MAP GENERATION ==========
+    // Combine multiple noise types for varied terrain
+
+    // Base terrain (rolling hills)
+    float baseHeight = fbm(samplePos * 0.5, Octaves, Persistence, Lacunarity);
+
+    // Mountain ridges
+    float mountains = ridgedNoise(samplePos * 0.3, 6, 0.5, 2.2);
+    mountains = pow(mountains, 2.0); // Sharpen peaks
+
+    // Large-scale continent shapes
+    float continents = fbm(samplePos * 0.1, 3, 0.6, 2.0);
+    continents = smoothstep(0.3, 0.7, continents); // Create ocean/land threshold
+
+    // Small detail variations
+    float detail = fbm(samplePos * 2.0, 4, 0.4, 2.5) * 0.1;
+
+    // Combine height layers
+    float height = baseHeight * 0.4 + mountains * 0.4 * continents + detail;
+    height *= continents; // Ocean areas near zero
+    height = saturate(height) * HeightMultiplier;
+
+    HeightMap[index] = height;
+
+    // ========== MOISTURE MAP GENERATION ==========
+    // Moisture affected by height (lower = more moisture) and noise
+
+    float baseMoisture = fbm(samplePos * 0.7 + float2(1000, 1000), 4, 0.5, 2.0);
+
+    // Coastal areas are more moist
+    float coastalInfluence = 1.0 - continents;
+
+    // Low areas collect water
+    float heightInfluence = 1.0 - saturate(height / HeightMultiplier);
+
+    // Voronoi for varied moisture pockets
+    float moisturePockets = voronoi(samplePos * 0.4) * 0.3;
+
+    float moisture = saturate(baseMoisture * 0.5 + coastalInfluence * 0.3 + heightInfluence * 0.2 + moisturePockets);
+
+    MoistureMap[index] = moisture;
+
+    // ========== TEMPERATURE MAP GENERATION ==========
+    // Temperature affected by latitude, height, and noise
+
+    // Latitude-based temperature (equator is hot, poles are cold)
+    float latitude = abs(worldPos.y) * 0.001; // Adjust this for world size
+    float latitudeTemp = 1.0 - saturate(latitude);
+
+    // Height-based temperature (mountains are cold)
+    float heightTemp = 1.0 - saturate(height / (HeightMultiplier * 0.7));
+
+    // Add noise variation
+    float tempNoise = fbm(samplePos * 0.6 + float2(2000, 2000), 3, 0.4, 2.0);
+
+    float temperature = saturate(latitudeTemp * 0.6 + heightTemp * 0.3 + tempNoise * 0.1);
+
+    TemperatureMap[index] = temperature;
+}
+
+[numthreads(8, 8, 1)]
+void ApplyWorldEvents(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Resolution || id.y >= Resolution)
+        return;
+
+    int index = id.x + id.y * Resolution;
+
+    // Calculate world position
+    float2 worldPos = float2(
+        ChunkX * ChunkSize + (id.x / (float)Resolution) * ChunkSize,
+        ChunkZ * ChunkSize + (id.y / (float)Resolution) * ChunkSize
+    );
+
+    // Apply each active world event
+    for (int i = 0; i < 8; i++) // Max 8 events per chunk
+    {
+        WorldEvent evt = ActiveEvents[i];
+
+        if (evt.type == 0) // None
+            continue;
+
+        float2 evtPos = float2(evt.epicenter.x, evt.epicenter.z);
+        float distance = length(worldPos - evtPos);
+
+        if (distance > evt.radius)
+            continue;
+
+        float influence = 1.0 - saturate(distance / evt.radius);
+        influence = pow(influence, 2.0) * evt.intensity;
+
+        if (evt.type == 1) // Magical Explosion - raise terrain
+        {
+            float raise = influence * 20.0;
+            HeightMap[index] = HeightMap[index] + raise;
+        }
+        else if (evt.type == 2) // Crystallized Terrain - flatten and sharpen
+        {
+            float flatten = lerp(HeightMap[index], evt.epicenter.y, influence * 0.5);
+            HeightMap[index] = flatten;
+
+            // Add crystalline patterns
+            float crystal = voronoi(worldPos * 0.5) * influence;
+            HeightMap[index] += crystal * 5.0;
+
+            // Reduce moisture in crystallized areas
+            MoistureMap[index] *= (1.0 - influence * 0.7);
+        }
+        else if (evt.type == 3) // Faction Influence - subtle modifications
+        {
+            // Smooth terrain slightly
+            HeightMap[index] = lerp(HeightMap[index], evt.epicenter.y, influence * 0.2);
+        }
+        else if (evt.type == 4) // Natural Disaster - chaotic changes
+        {
+            float chaos = noise(worldPos * 10.0 + evt.timestamp);
+            HeightMap[index] += chaos * influence * 10.0;
+            MoistureMap[index] = saturate(MoistureMap[index] + influence * (chaos - 0.5));
+        }
+    }
+}
